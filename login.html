@@ -2,63 +2,21 @@
 <html lang="pt-br">
 <head>
   <meta charset="utf-8">
-  <title>Painel Admin</title>
+  <title>Login Admin</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 24px; background:#111; color:#eee; }
-    table { border-collapse: collapse; width: 100%; background:#1a1a1a; }
-    th, td { border: 1px solid #333; padding: 8px; }
-    th { background:#222; }
-    input, button { padding: 8px; margin: 4px; }
-    form.inline { display:inline; }
-    .box { background:#1a1a1a; padding:16px; margin-bottom:20px; border:1px solid #333; }
+    body { font-family: Arial, sans-serif; background:#111; color:#eee; display:flex; align-items:center; justify-content:center; height:100vh; }
+    .box { background:#1a1a1a; padding:24px; border:1px solid #333; width:320px; }
+    input, button { width:100%; padding:10px; margin:6px 0; }
   </style>
 </head>
 <body>
-  <h1>Painel Admin</h1>
-  <p><a href="/admin/logout" style="color:#8cf;">Sair</a></p>
-
   <div class="box">
-    <h2>Criar usuário</h2>
-    <form method="post" action="/admin/user/create">
+    <h2>Login Admin</h2>
+    <form method="post" action="/admin/login">
       <input name="username" placeholder="Usuário" required>
-      <input name="password" placeholder="Senha" required>
-      <input name="plan_name" placeholder="Plano" value="basic" required>
-      <input name="days_valid" placeholder="Dias" value="30" required>
-      <button type="submit">Criar</button>
+      <input name="password" type="password" placeholder="Senha" required>
+      <button type="submit">Entrar</button>
     </form>
-  </div>
-
-  <div class="box">
-    <h2>Usuários</h2>
-    <table>
-      <tr>
-        <th>ID</th><th>Usuário</th><th>Plano</th><th>Ativo</th><th>Bloqueado</th>
-        <th>Expira</th><th>Máquina</th><th>Ações</th>
-      </tr>
-      {% for u in users %}
-      <tr>
-        <td>{{ u.id }}</td>
-        <td>{{ u.username }}</td>
-        <td>{{ u.plan_name }}</td>
-        <td>{{ "sim" if u.is_active else "não" }}</td>
-        <td>{{ "sim" if u.is_blocked else "não" }}</td>
-        <td>{{ u.expires_at }}</td>
-        <td>{{ u.machine_id or "-" }}</td>
-        <td>
-          <form class="inline" method="post" action="/admin/user/block/{{u.id}}">
-            <button type="submit">{{ "Desbloquear" if u.is_blocked else "Bloquear" }}</button>
-          </form>
-          <form class="inline" method="post" action="/admin/user/reset-machine/{{u.id}}">
-            <button type="submit">Resetar máquina</button>
-          </form>
-          <form class="inline" method="post" action="/admin/user/extend/{{u.id}}">
-            <input name="days" value="30" style="width:60px">
-            <button type="submit">+ dias</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </table>
   </div>
 </body>
 </html>
