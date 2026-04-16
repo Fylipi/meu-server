@@ -1,4 +1,18 @@
-fastapi
-uvicorn
-jinja2
-python-multipart
+services:
+  - type: web
+    name: farm-saas-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: JWT_SECRET
+        sync: false
+      - key: FRAME_ENC_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_WEB_USER
+        sync: false
+      - key: ADMIN_WEB_PASS
+        sync: false
