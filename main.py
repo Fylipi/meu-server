@@ -21,23 +21,24 @@ def health():
 @app.get("/admin/login", response_class=HTMLResponse)
 def admin_login_page(request: Request):
     return templates.TemplateResponse(
-        name="login.html",
-        context={"request": request}
+        "login.html",
+        {"request": request}
     )
 
 @app.post("/admin/login")
 def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
     if username == ADMIN_USER and password == ADMIN_PASS:
         return RedirectResponse(url="/admin", status_code=302)
+
     return templates.TemplateResponse(
-        name="login.html",
-        context={"request": request, "error": "Login inválido"},
+        "login.html",
+        {"request": request, "error": "Login inválido"},
         status_code=401
     )
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
     return templates.TemplateResponse(
-        name="admin.html",
-        context={"request": request}
+        "admin.html",
+        {"request": request}
     )
