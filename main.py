@@ -11,16 +11,17 @@ ADMIN_USER = os.getenv("ADMIN_WEB_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_WEB_PASS", "admin123")
 
 @app.get("/")
-def root():
+async def root():
     return RedirectResponse(url="/admin/login", status_code=302)
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 @app.get("/admin/login", response_class=HTMLResponse)
 async def admin_login_page(request: Request):
     return templates.TemplateResponse(
+        request,
         "login.html",
         {"request": request}
     )
@@ -31,13 +32,16 @@ async def admin_login(request: Request, username: str = Form(...), password: str
         return RedirectResponse(url="/admin", status_code=302)
 
     return templates.TemplateResponse(
+        request,
         "login.html",
-        {"request": request, "error": "Login inválido"}
+        {"request": request, "error": "Login inválido"},
+        status_code=401
     )
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(request: Request):
     return templates.TemplateResponse(
+        request,
         "admin.html",
         {"request": request}
     )
