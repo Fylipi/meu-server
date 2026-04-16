@@ -1,0 +1,399 @@
+import os
+import hashlib
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, HTTPException, Depends, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from sqlalchemy import create_engine, String, Boolean, Integer, DateTime, ForeignKey, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session, relationship
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+
+load_dotenv()
+
+APP_NAME = "Farm SaaS Pro API"
+JWT_SECRET = os.getenv("JWT_SECRET", "troque-esta-chave-agora")
+JWT_ALG = "HS256"
+JWT_EXPIRE_MIN = int(os.getenv("JWT_EXPIRE_MIN", "45"))
+DB_URL = os.getenv("DATABASE_URL", "sqlite:///./farm_saas.db")
+FRAME_ENC_KEY = os.getenv("FRAME_ENC_KEY", "")
+ADMIN_WEB_USER = os.getenv("ADMIN_WEB_USER", "admin")
+ADMIN_WEB_PASS = os.getenv("ADMIN_WEB_PASS", "admin123")
+
+if not FRAME_ENC_KEY:
+    raise RuntimeError("Defina FRAME_ENC_KEY no .env")
+
+fernet = Fernet(FRAME_ENC_KEY.encode())
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+templates = Jinja2Templates(directory="templates")
+
+logging.basicConfig(
+    filename="server.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+limiter = Limiter(key_func=get_remote_address)
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    plan_name: Mapped[str] = mapped_column(String(64), default="basic")
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    machine_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    max_machines: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    heartbeats: Mapped[List["Heartbeat"]] = relationship(back_populates="user")
+    logs: Mapped[List["ActionLog"]] = relationship(back_populates="user")
+
+class Heartbeat(Base):
+    __tablename__ = "heartbeats"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    machine_id: Mapped[str] = mapped_column(String(128))
+    ip: Mapped[str] = mapped_column(String(64))
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    user: Mapped[User] = relationship(back_populates="heartbeats")
+
+class ActionLog(Base):
+    __tablename__ = "action_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    machine_id: Mapped[str] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(64))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    user: Mapped[User] = relationship(back_populates="logs")
+
+engine = create_engine(DB_URL, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base.metadata.create_all(engine)
+
+app = FastAPI(title=APP_NAME)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+    machine_id: str = Field(min_length=4, max_length=128)
+
+class RegisterIn(BaseModel):
+    username: str
+    password: str
+    plan_name: str = "basic"
+    days_valid: int = 30
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    config: dict
+
+class HeartbeatIn(BaseModel):
+    machine_id: str
+
+class ProcessIn(BaseModel):
+    machine_id: str
+    frame_b64_encrypted: str
+    frame_sha256: str
+
+class CommandOut(BaseModel):
+    action: str
+    x: Optional[int] = None
+    y: Optional[int] = None
+    key: Optional[str] = None
+    meta: dict = Field(default_factory=dict)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+def create_token(user: User) -> str:
+    exp = utcnow() + timedelta(minutes=JWT_EXPIRE_MIN)
+    payload = {"sub": user.username, "uid": user.id, "machine_id": user.machine_id, "exp": exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)) -> User:
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
+        username = payload.get("sub")
+        machine_id = payload.get("machine_id")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuário não encontrado")
+    if user.is_blocked:
+        raise HTTPException(status_code=403, detail="Conta bloqueada remotamente")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Licença inativa")
+    if user.expires_at and user.expires_at < utcnow():
+        raise HTTPException(status_code=403, detail="Licença expirada")
+    if machine_id and user.machine_id and machine_id != user.machine_id:
+        raise HTTPException(status_code=403, detail="Máquina não autorizada")
+    return user
+
+def default_runtime_config(user: User) -> dict:
+    return {
+        "plan": user.plan_name,
+        "heartbeat_interval_sec": 15,
+        "max_frame_fps": 4,
+        "jpeg_quality": 65,
+        "enable_farm": True,
+        "server_side_logic": True,
+    }
+
+def detect_target_simple(frame: np.ndarray):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, th = cv2.threshold(blur, 205, 255, cv2.THRESH_BINARY)
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_score = -1
+    h, w = gray.shape[:2]
+    px, py = w // 2, int(h * 0.65)
+
+    for c in cnts:
+        x, y, cw, ch = cv2.boundingRect(c)
+        area = cw * ch
+        if area < 40:
+            continue
+        cx = x + cw // 2
+        cy = y + ch // 2
+        dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+        score = area - dist * 0.35
+        if score > best_score:
+            best_score = score
+            best = (cx, cy, x, y, cw, ch)
+    return best
+
+def decrypt_frame(enc_b64: str) -> np.ndarray:
+    raw = fernet.decrypt(enc_b64.encode())
+    arr = np.frombuffer(raw, np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Frame inválido")
+    return frame
+
+def admin_session_ok(request: Request) -> bool:
+    return request.cookies.get("admin_ok") == "1"
+
+@app.on_event("startup")
+def create_default_admin():
+    db = SessionLocal()
+    try:
+        exists = db.query(User).filter(User.username == "admin").first()
+        if not exists:
+            db.add(User(
+                username="admin",
+                password_hash=hash_password("123456"),
+                is_active=True,
+                is_blocked=False,
+                plan_name="admin",
+                expires_at=utcnow() + timedelta(days=3650),
+            ))
+            db.commit()
+    finally:
+        db.close()
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": APP_NAME}
+
+@app.post("/auth/register")
+def register_user(body: RegisterIn, db: Session = Depends(get_db)):
+    exists = db.query(User).filter(User.username == body.username).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="Usuário já existe")
+    user = User(
+        username=body.username,
+        password_hash=hash_password(body.password),
+        is_active=True,
+        is_blocked=False,
+        plan_name=body.plan_name,
+        expires_at=utcnow() + timedelta(days=body.days_valid),
+    )
+    db.add(user)
+    db.commit()
+    return {"status": "ok", "username": user.username}
+
+@app.post("/auth/login", response_model=TokenOut)
+@limiter.limit("10/minute")
+def login(req: Request, body: LoginIn, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == body.username).first()
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Login inválido")
+    if user.is_blocked:
+        raise HTTPException(status_code=403, detail="Conta bloqueada")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Licença inativa")
+    if user.expires_at and user.expires_at < utcnow():
+        raise HTTPException(status_code=403, detail="Licença expirada")
+
+    if user.machine_id is None:
+        user.machine_id = body.machine_id
+    elif user.machine_id != body.machine_id:
+        raise HTTPException(status_code=403, detail="Máquina não autorizada")
+
+    db.commit()
+    token = create_token(user)
+    return TokenOut(access_token=token, expires_in=JWT_EXPIRE_MIN * 60, config=default_runtime_config(user))
+
+@app.post("/client/heartbeat")
+@limiter.limit("60/minute")
+def heartbeat(req: Request, body: HeartbeatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.machine_id != body.machine_id:
+        raise HTTPException(status_code=403, detail="Machine mismatch")
+
+    hb = db.query(Heartbeat).filter(Heartbeat.user_id == user.id, Heartbeat.machine_id == body.machine_id).first()
+    if hb is None:
+        hb = Heartbeat(user_id=user.id, machine_id=body.machine_id, ip=get_remote_address(req), last_seen=utcnow())
+        db.add(hb)
+    else:
+        hb.last_seen = utcnow()
+        hb.ip = get_remote_address(req)
+    db.commit()
+    return {"status": "ok", "blocked": user.is_blocked, "active": user.is_active}
+
+@app.post("/farm/process", response_model=CommandOut)
+@limiter.limit("120/minute")
+def process_frame(req: Request, body: ProcessIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.machine_id != body.machine_id:
+        raise HTTPException(status_code=403, detail="Machine mismatch")
+
+    encrypted_bytes = body.frame_b64_encrypted.encode()
+    sha = hashlib.sha256(encrypted_bytes).hexdigest()
+    if sha != body.frame_sha256:
+        raise HTTPException(status_code=400, detail="Hash inválido")
+
+    frame = decrypt_frame(body.frame_b64_encrypted)
+    target = detect_target_simple(frame)
+
+    if target:
+        cx, cy, x, y, w, h = target
+        db.add(ActionLog(user_id=user.id, machine_id=body.machine_id, action="click", detail=f"target=({cx},{cy}) bbox=({x},{y},{w},{h})"))
+        db.commit()
+        return CommandOut(action="click", x=cx, y=cy, meta={"bbox": [x, y, w, h]})
+
+    db.add(ActionLog(user_id=user.id, machine_id=body.machine_id, action="idle", detail="no_target"))
+    db.commit()
+    return CommandOut(action="idle", meta={"reason": "no_target"})
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
+
+@app.post("/admin/login")
+def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
+    if username != ADMIN_WEB_USER or password != ADMIN_WEB_PASS:
+        raise HTTPException(status_code=401, detail="Login admin inválido")
+    resp = RedirectResponse(url="/admin", status_code=302)
+    resp.set_cookie("admin_ok", "1", httponly=True, samesite="lax")
+    return resp
+
+@app.get("/admin/logout")
+def admin_logout():
+    resp = RedirectResponse(url="/admin/login", status_code=302)
+    resp.delete_cookie("admin_ok")
+    return resp
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_home(request: Request, db: Session = Depends(get_db)):
+    if not admin_session_ok(request):
+        return RedirectResponse(url="/admin/login", status_code=302)
+    users = db.query(User).order_by(User.id.desc()).all()
+    return templates.TemplateResponse("admin.html", {"request": request, "users": users})
+
+@app.post("/admin/user/create")
+def admin_user_create(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    plan_name: str = Form("basic"),
+    days_valid: int = Form(30),
+    db: Session = Depends(get_db),
+):
+    if not admin_session_ok(request):
+        raise HTTPException(status_code=403, detail="Sem sessão admin")
+    exists = db.query(User).filter(User.username == username).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="Usuário já existe")
+    db.add(User(
+        username=username,
+        password_hash=hash_password(password),
+        is_active=True,
+        is_blocked=False,
+        plan_name=plan_name,
+        expires_at=utcnow() + timedelta(days=days_valid),
+    ))
+    db.commit()
+    return RedirectResponse(url="/admin", status_code=302)
+
+@app.post("/admin/user/block/{user_id}")
+def admin_user_block(request: Request, user_id: int, db: Session = Depends(get_db)):
+    if not admin_session_ok(request):
+        raise HTTPException(status_code=403, detail="Sem sessão admin")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    user.is_blocked = not user.is_blocked
+    db.commit()
+    return RedirectResponse(url="/admin", status_code=302)
+
+@app.post("/admin/user/reset-machine/{user_id}")
+def admin_reset_machine(request: Request, user_id: int, db: Session = Depends(get_db)):
+    if not admin_session_ok(request):
+        raise HTTPException(status_code=403, detail="Sem sessão admin")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    user.machine_id = None
+    db.commit()
+    return RedirectResponse(url="/admin", status_code=302)
+
+@app.post("/admin/user/extend/{user_id}")
+def admin_extend_user(request: Request, user_id: int, days: int = Form(...), db: Session = Depends(get_db)):
+    if not admin_session_ok(request):
+        raise HTTPException(status_code=403, detail="Sem sessão admin")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    base_date = user.expires_at if user.expires_at and user.expires_at > utcnow() else utcnow()
+    user.expires_at = base_date + timedelta(days=days)
+    db.commit()
+    return RedirectResponse(url="/admin", status_code=302)
