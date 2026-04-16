@@ -19,25 +19,24 @@ def health():
     return {"status": "ok"}
 
 @app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page(request: Request):
+async def admin_login_page(request: Request):
     return templates.TemplateResponse(
         "login.html",
         {"request": request}
     )
 
-@app.post("/admin/login")
-def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
+@app.post("/admin/login", response_class=HTMLResponse)
+async def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
     if username == ADMIN_USER and password == ADMIN_PASS:
         return RedirectResponse(url="/admin", status_code=302)
 
     return templates.TemplateResponse(
         "login.html",
-        {"request": request, "error": "Login inválido"},
-        status_code=401
+        {"request": request, "error": "Login inválido"}
     )
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_panel(request: Request):
+async def admin_panel(request: Request):
     return templates.TemplateResponse(
         "admin.html",
         {"request": request}
